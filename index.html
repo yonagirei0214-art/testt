@@ -781,29 +781,27 @@ function rollGacha(){
 
 /* ===== FILE TRANSFER ===== */
 function sendChunks(conn,ab,fileName,mimeType,pid,onDone){
-  // Base64変換を廃止し、PeerJSのbinary serializationでArrayBufferを直接送信。
-  // 49KB + 8ms待機 → 256KB単位のバイナリ転送に変更。
+  // iPhone/Safariでの安定性を優先して、64KBずつ・イベントループを
+  // 定期的に返しながら送信する。以前の256KB + microtask連打は、
+  // 大量ファイル時に受信側UI/受信イベントを詰まらせることがあった。
   const bytes=new Uint8Array(ab);
-  const CS=256*1024;
+  const CS=64*1024;
   const total=Math.ceil(bytes.byteLength/CS);
   conn.send({type:'file_start',fileName,mimeType,totalChunks:total,totalSize:bytes.byteLength,pid:pid||null,transferMode:'binary'});
   let idx=0;
   const next=()=>{
     if(!conn.open){if(onDone)onDone(new Error('connection closed'));return;}
     if(idx>=total){
-      conn.send({type:'file_end',fileName,pid:pid||null});
+      conn.send({type:'file_end',fileName,pid:pid||null,totalChunks:total,totalSize:bytes.byteLength});
       if(onDone)onDone();
       return;
     }
     const start=idx*CS,end=Math.min(start+CS,bytes.byteLength);
     conn.send(bytes.buffer.slice(start,end));
     idx++;
-    // DataChannelの送信バッファを膨らませすぎない
-    if(conn.dataChannel && conn.dataChannel.bufferedAmount>4*1024*1024){
-      setTimeout(next,12);
-    }else{
-      queueMicrotask(next);
-    }
+    // 送信バッファを抑え、必ず一定間隔でブラウザに処理時間を返す。
+    const buffered=conn.dataChannel?.bufferedAmount||0;
+    setTimeout(next, buffered>1024*1024 ? 12 : 2);
   };
   next();
 }

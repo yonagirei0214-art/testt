@@ -506,12 +506,37 @@ const st={
   results:[],currentResultIdx:-1,
   fastMode:false,fastTotal:0,fastStartIdx:0,
   sessionId:null,sessionLabel:'',
-  ignoreSpins:0,batchPending:0,batchId:0,curPid:null
+  ignoreSpins:0,batchPending:0,batchId:0,curPid:null,
+  binaryExpectedChunks:0,binaryExpectedSize:0,binaryReceivedBytes:0,binaryReceiveTimer:null,
+  batchReceiveFailed:0
 };
 
 // ZIPの事前生成用
 let _zipUrl=null;
 let _zipName='gacha-prizes.zip';
+const RESULT_CACHE_KEY='gacha-guest-active-results-v1';
+
+function cacheResults(){
+  try{
+    const data={sessionId:st.sessionId,sessionLabel:st.sessionLabel,remainingSpins:st.remainingSpins,
+      results:st.results.map(r=>({pid:r.pid,ro:r.ro,sessBatch:r.sessBatch,rarity:r.rarity,prize:r.prize,
+        dlName:r.dlName,dlMime:r.dlMime,hasData:!!r.arrayBuffer}))};
+    localStorage.setItem(RESULT_CACHE_KEY,JSON.stringify(data));
+  }catch(e){console.warn('cacheResults failed:',e);}
+}
+function restoreCachedResults(){
+  try{
+    const raw=localStorage.getItem(RESULT_CACHE_KEY);if(!raw)return false;
+    const data=JSON.parse(raw);if(!data?.results?.length)return false;
+    st.sessionId=data.sessionId||st.sessionId;st.sessionLabel=data.sessionLabel||st.sessionLabel;
+    st.remainingSpins=Number.isFinite(data.remainingSpins)?data.remainingSpins:st.remainingSpins;
+    st.results=data.results.map(r=>({...r,dlUrl:null,arrayBuffer:null,bonusAwarded:0}));
+    // リロード時は通信中の状態を引き継がない。受信済みファイルは履歴から確認できる。
+    st.batchPending=0;st.batchReceiveFailed=st.results.filter(r=>r.prize?.hasFile&&!r.arrayBuffer).length;
+    return true;
+  }catch(e){console.warn('restoreCachedResults failed:',e);return false;}
+}
+function clearCachedResults(){try{localStorage.removeItem(RESULT_CACHE_KEY);}catch(e){}}
 
 /* ===== CONNECTION ===== */
 const params=new URLSearchParams(location.search);
@@ -521,7 +546,7 @@ let _reconnecting=false;
 window.onload=async()=>{
   await openHistDb().catch(()=>{});
   const hasHist=await checkHistoryExists().catch(()=>false);
-  if(hasHist){document.getElementById('histBtn').style.display='';}
+  document.getElementById('histBtn').style.display='';
   if(!roomId){showError('URLにルームIDがありません。\nライバーから受け取ったURLを開いてください。');return;}
   connect();
 };
@@ -568,6 +593,10 @@ function onData(data){
   if(data instanceof ArrayBuffer || ArrayBuffer.isView(data)){
     const u8=data instanceof ArrayBuffer?new Uint8Array(data):new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
     st.binaryChunks.push(u8.slice());
+    st.binaryReceivedBytes+=u8.byteLength;
+    // 各チャンク受信でタイムアウトを延長。file_endが来ない場合も永久停止させない。
+    clearTimeout(st.binaryReceiveTimer);
+    st.binaryReceiveTimer=setTimeout(()=>finishStalledFile(),25000);
     return;
   }
   if(typeof data!=='object')return;
@@ -580,16 +609,22 @@ function onData(data){
       st.sessionLabel=new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
       // 再接続時の状態リセット
       st.spinning=false;st.animDone=false;st.fileDone=false;
-      st.fastMode=false;st.ignoreSpins=0;st.batchPending=0;
+      st.fastMode=false;st.ignoreSpins=0;st.batchPending=0;st.batchReceiveFailed=0;
       clearTimeout(_spinTimeout);
+      clearTimeout(st.binaryReceiveTimer);st.binaryReceiveTimer=null;
+      st.binaryChunks=[];st.chunks=[];st.curPid=null;st.binaryExpectedChunks=0;st.binaryExpectedSize=0;st.binaryReceivedBytes=0;
       document.getElementById('overlay').classList.remove('show');
       document.getElementById('pinInput').value='';
       document.getElementById('playerName').textContent=data.name||st.name;
       document.getElementById('spinsNum').textContent=st.remainingSpins;
       document.getElementById('costHint').textContent=data.costPerSpin+'Pt / 1回'
         +(st.bonusEvery&&st.bonusFree?`　${st.bonusEvery}回ごとに${st.bonusFree}回無料`:'');
+      const restored=restoreCachedResults();
       showScreen('screen-gacha');
       setGachaBtn(true);
+      if(restored){
+        document.getElementById('histBtn').style.display='';
+      }
       break;
     case 'error':
       showScreen('screen-name');
@@ -611,14 +646,24 @@ function onData(data){
       else{forceCloseOverlay();alert(data.message||'残り回数がないか、エラーが発生しました。');}
       break;
     case 'file_start':
-      st.chunks=[];st.binaryChunks=[];st.totalChunks=data.totalChunks;
+      clearTimeout(st.binaryReceiveTimer);
+      st.binaryReceiveTimer=setTimeout(()=>finishStalledFile(),25000);
+      st.chunks=[];st.binaryChunks=[];st.totalChunks=data.totalChunks||0;
+      st.binaryExpectedChunks=data.totalChunks||0;
+      st.binaryExpectedSize=data.totalSize||0;
+      st.binaryReceivedBytes=0;
       st.dlName=data.fileName;st.dlMime=data.mimeType||'application/octet-stream';st.curPid=data.pid||null;break;
     case 'file_chunk':
       // 旧方式との互換用
       st.chunks[data.i]=data.d;break;
     case 'file_end':
-      if(st.binaryChunks.length)buildBinaryFile();
-      else buildFile();
+      clearTimeout(st.binaryReceiveTimer);st.binaryReceiveTimer=null;
+      if(st.binaryChunks.length){
+        const chunkOk=!st.binaryExpectedChunks||st.binaryChunks.length===st.binaryExpectedChunks;
+        const sizeOk=!st.binaryExpectedSize||st.binaryReceivedBytes===st.binaryExpectedSize;
+        if(chunkOk&&sizeOk)buildBinaryFile();
+        else finishStalledFile('ファイルの一部が欠落しました');
+      }else buildFile();
       break;
     case 'spins_update':
       st.remainingSpins=data.remainingSpins;
@@ -721,6 +766,30 @@ function showCardResult(rarity,prize){
   },920);
 }
 
+function finishStalledFile(message='ファイル受信がタイムアウトしました'){
+  clearTimeout(st.binaryReceiveTimer);st.binaryReceiveTimer=null;
+  if(!st.curPid)return;
+  const failedPid=st.curPid;
+  st.binaryChunks=[];st.chunks=[];
+  st.binaryExpectedChunks=0;st.binaryExpectedSize=0;st.binaryReceivedBytes=0;st.curPid=null;
+  if(st.batchPending>0){
+    st.batchPending=Math.max(0,st.batchPending-1);
+    st.batchReceiveFailed++;
+    onFileProgress();
+    if(getCurrentScreen()==='screen-results'){
+      const btn=document.getElementById('batchDlBtn');
+      btn.textContent=`${st.batchReceiveFailed}件のファイルを受信できませんでした`;
+      btn.disabled=false;
+      btn.onclick=()=>prepareZip();
+    }
+    cacheResults();
+    console.warn('file receive failed:',failedPid,message);
+  }else{
+    st.fileDone=true;
+    tryShowDl();
+  }
+}
+
 function buildBinaryFile(){
   const inBatch=st.batchPending>0&&!!st.curPid;
   try{
@@ -734,6 +803,7 @@ function buildBinaryFile(){
       const rs=st.results.filter(r=>r.pid===st.curPid&&r.sessBatch===st.batchId&&!r.arrayBuffer);
       rs.forEach(r=>{r.dlUrl=url;r.dlName=st.dlName;r.dlMime=st.dlMime;r.arrayBuffer=ab;});
       if(rs[0])savePrizeToHistory({...rs[0],count:rs.length},st.sessionId,st.sessionLabel).then(()=>{document.getElementById('histBtn').style.display='';});
+      cacheResults();
     }else{
       st.dlUrl=url;
       if(st.currentResultIdx>=0){
@@ -742,11 +812,12 @@ function buildBinaryFile(){
         savePrizeToHistory(r,st.sessionId,st.sessionLabel).then(()=>{document.getElementById('histBtn').style.display='';});
       }
       st.fileDone=true;tryShowDl();
+      cacheResults();
     }
   }catch(e){console.error('buildBinaryFile error:',e);}
   finally{
     if(inBatch){st.batchPending=Math.max(0,st.batchPending-1);onFileProgress();}
-    st.binaryChunks=[];st.chunks=[];
+    st.binaryChunks=[];st.chunks=[];st.binaryExpectedChunks=0;st.binaryExpectedSize=0;st.binaryReceivedBytes=0;st.curPid=null;
   }
 }
 
@@ -763,6 +834,7 @@ function buildFile(){
       const rs=st.results.filter(r=>r.pid===st.curPid&&r.sessBatch===st.batchId&&!r.arrayBuffer);
       rs.forEach(r=>{r.dlUrl=url;r.dlName=st.dlName;r.dlMime=st.dlMime;r.arrayBuffer=ab;});
       if(rs[0])savePrizeToHistory({...rs[0],count:rs.length},st.sessionId,st.sessionLabel).then(()=>{document.getElementById('histBtn').style.display='';});
+      cacheResults();
     }else{
       st.dlUrl=url;
       if(st.currentResultIdx>=0){
@@ -771,10 +843,12 @@ function buildFile(){
         savePrizeToHistory(r,st.sessionId,st.sessionLabel).then(()=>{document.getElementById('histBtn').style.display='';});
       }
       st.fileDone=true;tryShowDl();
+      cacheResults();
     }
   }catch(e){console.error('buildFile error:',e);}
   finally{
     if(inBatch){st.batchPending=Math.max(0,st.batchPending-1);st.chunks=[];onFileProgress();}
+    st.curPid=null;
   }
 }
 
@@ -863,6 +937,8 @@ function cancelFastMode(){
 function onBatchResult(d){
   clearTimeout(_spinTimeout);
   st.fastMode=false;st.spinning=false;
+  st.sessionId='sess-'+Date.now();
+  st.sessionLabel=new Date().toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
   st.batchId++;
   st.remainingSpins=d.remainingSpins;
   document.getElementById('spinsNum').textContent=st.remainingSpins;
@@ -873,6 +949,8 @@ function onBatchResult(d){
       dlUrl:null,dlName:null,dlMime:null,arrayBuffer:null,bonusAwarded:0});
   });
   st.batchPending=d.table.filter(t=>t.hasFile).length;
+  st.batchReceiveFailed=0;
+  cacheResults();
   showResults();
   setGachaBtn(true);
 }
@@ -907,6 +985,9 @@ function renderResults(){
   btn.style.display=hasFiles?'block':'none';
   btn.textContent=hasFiles?(st.batchPending>0?'ファイル受信中...':'ZIP準備中...'):'';
   btn.disabled=true;btn.onclick=null;
+  if(st.batchReceiveFailed>0 && st.batchPending===0 && hasFiles){
+    btn.textContent=`受信済みファイルをまとめてDL（未受信${st.batchReceiveFailed}件）`;
+  }
 
   const countMap={};
   st.results.forEach(r=>{const k=r.rarity.name;countMap[k]={count:(countMap[k]?.count||0)+1,color:r.rarity.color};});
@@ -1002,7 +1083,7 @@ function copyText(idx,btn){
   }).catch(()=>alert(r.prize.text));
 }
 
-function closeResults(){showScreen('screen-gacha');setGachaBtn(true);}
+function closeResults(){clearCachedResults();showScreen('screen-gacha');setGachaBtn(true);}
 
 /* ===== HISTORY ===== */
 async function showHistory(){
